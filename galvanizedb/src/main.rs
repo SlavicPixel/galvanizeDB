@@ -1,6 +1,10 @@
 use std::io::Write;
-use sqlx::{database, Pool, Result, Row, Column, Sqlite, TypeInfo};
-use sqlx::sqlite::{SqlitePool, SqliteRow};
+use sqlx::{Result, Row, Column, TypeInfo};
+use sqlx::sqlite::SqlitePool;
+use rustyline::Editor;
+use rustyline::config::Config;
+use rustyline::error::ReadlineError;
+use rustyline::history::MemHistory;
 
 fn get_user_input(prompt: &str) -> String {
     print!("{}", prompt);
@@ -35,50 +39,64 @@ async fn create_or_connect_database(db_name: &str) -> Result<SqlitePool, sqlx::E
 async fn execute_sql(pool: &SqlitePool, sql: &str) -> anyhow::Result<()> {
     if sql.trim().to_lowercase().starts_with("select") {
         let rows = sqlx::query(sql).fetch_all(pool).await?;
-        let mut columns_names: Vec<String> = Vec::new();
-        let mut individual_rows: Vec<Vec<String>> = Vec::new();
+
+        if rows.is_empty() {
+            println!("No results found.");
+            return Ok(());
+        }
+
+        let columns = rows[0].columns();
+        let mut column_widths: Vec<usize> = columns.iter().map(|col| col.name().len()).collect();
 
         for row in &rows {
-            let columns = row.columns();
-            let mut values: Vec<String> = Vec::new();
-
-            for col in columns {
-                let col_name = col.name();
-                let col_type = col.type_info();
-
-                if columns_names.len() < columns.len() {
-                    columns_names.push(col_name.to_string());                   
-                }
-
-
-                let value = if col_type.name() == "TEXT" {
-                    row.try_get::<String, _>(col_name).unwrap_or_default()
-                } else if col_type.name() == "INTEGER" {
-                    row.try_get::<i64, _>(col_name).map(|v| v.to_string()).unwrap_or_default()
-                } else {
+            for (i, col) in columns.iter().enumerate() {
+                let length = match col.type_info().name() {
+                    "TEXT" => row.try_get::<String, _>(col.name()).map(|v| v.len()).unwrap_or(0),
+                    "INTEGER" => row.try_get::<i64, _>(col.name()).map(|v| v.to_string().len()).unwrap_or(0),
                     // TODO: add support for other types, ex. date
-                    format!("Unsupported type: {}", col_type.name())
+                    _ => "Unsupported type".len(),
                 };
-
-                values.push(value);
-                
+                column_widths[i] = std::cmp::max(column_widths[i], length);
             }
-            individual_rows.push(values);
         }
 
-        for name in columns_names {
-            print!("{} ", name);
+        // Function to create a horizontal line
+        let create_line = |widths: &[usize]| {
+            widths
+                .iter()
+                .map(|w| "-".repeat(*w + 2))
+                .collect::<Vec<_>>()
+                .join("+")
+        };
+
+        // Print top border
+        println!("+{}+", create_line(&column_widths));
+
+        // Print header row
+        for (i, col) in columns.iter().enumerate() {
+            print!("| {:width$} ", col.name(), width = column_widths[i]);
         }
+        println!("|");
 
-        print!("\n");
+        // Print line after header
+        println!("+{}+", create_line(&column_widths));
 
-        for row in individual_rows {
-            for r in row {
-                print!("{} ", r);
+        // Print table rows
+        for row in &rows {
+            for (i, col) in columns.iter().enumerate() {
+                let value = match col.type_info().name() {
+                    "TEXT" => row.try_get::<String, _>(col.name()).unwrap_or_default(),
+                    "INTEGER" => row.try_get::<i64, _>(col.name()).map(|v| v.to_string()).unwrap_or_default(),
+                    // Add other type conversions as necessary
+                    _ => "Unsupported type".to_string(),
+                };
+                print!("| {:width$} ", value, width = column_widths[i]);
             }
-            print!("\n");
+            println!("|");
         }
 
+        // Print bottom border
+        println!("+{}+", create_line(&column_widths));
     } else {
         sqlx::query(sql).execute(pool).await?;
         println!("Query executed successfully.");
@@ -87,25 +105,39 @@ async fn execute_sql(pool: &SqlitePool, sql: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-
-
-
-
 #[tokio::main]
 async fn main() -> Result<(), sqlx::Error> {
-    let mut database_name = get_database_name();
+    let config = Config::default();
+    let mut rl = Editor::<(), MemHistory>::with_history(config, MemHistory::new())
+        .expect("Failed to create editor");
 
-    let mut sql_pool = create_or_connect_database(&database_name).await?;
+    print!("\x1B[2J\x1B[1;1H"); 
+    
+    let database_name = get_database_name();
+    let sql_pool = create_or_connect_database(&database_name).await?;
 
     loop {
-        let sql = get_user_input("Enter SQL query (or 'exit' to quit):");
-        if sql.to_lowercase() == "exit" {
-            break;
-        }
+        let prompt = format!("GalvanizeDB [{database_name}]> ");
 
-        match execute_sql(&sql_pool, &sql).await {
-            Ok(_) => println!("Query executed successfully."),
-            Err(e) => println!("Error executing query: {}", e),
+        match rl.readline(&prompt) {
+            Ok(line) => {
+                if let Err(e) = rl.add_history_entry(line.as_str()) {
+                    eprintln!("Failed to add history entry: {}", e);
+                }
+                if line.to_lowercase() == "exit" {
+                    break;
+                }
+                match execute_sql(&sql_pool, &line).await {
+                    Ok(_) => println!("Query executed successfully."),
+                    Err(e) => println!("Error executing query: {}", e),
+                }
+            },
+            Err(ReadlineError::Interrupted) | Err(ReadlineError::Eof) => {
+                break;
+            },
+            Err(err) => {
+                println!("Error reading line: {:?}", err);
+            }
         }
     }
 
