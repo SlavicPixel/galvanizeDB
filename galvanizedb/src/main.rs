@@ -1,33 +1,41 @@
-use std::io::Write;
-use sqlx::{Result, Row, Column, TypeInfo};
+use sqlx::{Column, Result, Row, TypeInfo};
 use sqlx::sqlite::SqlitePool;
 use rustyline::Editor;
 use rustyline::config::Config;
 use rustyline::error::ReadlineError;
 use rustyline::history::MemHistory;
 
-fn get_user_input(prompt: &str) -> String {
-    print!("{}", prompt);
-    
-    std::io::stdout().flush().unwrap();
+fn extract_db_name(input: &str) -> Option<String> {
+    let parts: Vec<&str> = input.split_whitespace().collect();
 
-    let mut input = String::new();
-    std::io::stdin()
-        .read_line(&mut input)
-        .unwrap();
+    if parts.len() >= 2 {
+        let command = parts[0].to_uppercase(); // Convert the command to uppercase for case-insensitive comparison
 
-    input.trim().to_string()
+        if command == "USE" && parts.len() == 2 {
+            // Handle "USE database_name;" case
+            let database_name = parts[1].strip_suffix(';').unwrap_or(parts[1]);
+            Some(format_db_name(database_name))
+        } else if (command == "CREATE" || command == "DROP") && parts.len() >= 3 && parts[1].eq_ignore_ascii_case("database") {
+            // Handle "CREATE DATABASE database_name;" case
+            let database_name = parts[2].strip_suffix(';').unwrap_or(parts[2]);
+            Some(format_db_name(database_name))
+        } else {
+            None
+        }
+    } else {
+        None
+    }
 }
 
-fn get_database_name() -> String {
-    let mut database_name = get_user_input("Please enter name of a new or existing database: ");
-    
-    if !database_name.ends_with(".db") {
-        database_name.push_str(".db");
+// Helper function to format the database name
+fn format_db_name(name: &str) -> String {
+    let mut formatted_name = name.to_string();
+
+    if !formatted_name.ends_with(".db") {
+        formatted_name.push_str(".db");
     }
 
-    database_name
-
+    formatted_name
 }
 
 async fn create_or_connect_database(db_name: &str) -> Result<SqlitePool, sqlx::Error> {
@@ -87,8 +95,11 @@ async fn execute_sql(pool: &SqlitePool, sql: &str) -> anyhow::Result<()> {
                 let value = match col.type_info().name() {
                     "TEXT" => row.try_get::<String, _>(col.name()).unwrap_or_default(),
                     "INTEGER" => row.try_get::<i64, _>(col.name()).map(|v| v.to_string()).unwrap_or_default(),
-                    // Add other type conversions as necessary
-                    _ => "Unsupported type".to_string(),
+                    _ => {
+                        // Attempt to get the value as f64 for any other types, including REAL and potential aggregate results
+                        row.try_get::<f64, _>(col.name()).map(|v| v.to_string())
+                            .unwrap_or_else(|_| "Unsupported type".to_string())
+                    },
                 };
                 print!("| {:width$} ", value, width = column_widths[i]);
             }
@@ -99,40 +110,110 @@ async fn execute_sql(pool: &SqlitePool, sql: &str) -> anyhow::Result<()> {
         println!("+{}+", create_line(&column_widths));
     } else {
         sqlx::query(sql).execute(pool).await?;
-        println!("Query executed successfully.");
     }
 
     Ok(())
 }
 
 #[tokio::main]
-async fn main() -> Result<(), sqlx::Error> {
+async fn main() -> Result<()> {
     let config = Config::default();
     let mut rl = Editor::<(), MemHistory>::with_history(config, MemHistory::new())
         .expect("Failed to create editor");
 
-    print!("\x1B[2J\x1B[1;1H"); 
+    //print!("\x1B[2J\x1B[1;1H"); // clears the terminal
     
-    let database_name = get_database_name();
-    let sql_pool = create_or_connect_database(&database_name).await?;
+    let mut database_name = "None".to_string();
+    let mut sql_pool: Option<SqlitePool> = None;
 
     loop {
-        let prompt = format!("GalvanizeDB [{database_name}]> ");
+        let prompt = format!("GalvanizeDB [{}]> ", database_name);
 
         match rl.readline(&prompt) {
             Ok(line) => {
-                if let Err(e) = rl.add_history_entry(line.as_str()) {
-                    eprintln!("Failed to add history entry: {}", e);
+                let _ = rl.add_history_entry(line.as_str());
+
+                if line.to_lowercase().starts_with("use ") || line.to_lowercase().starts_with("create database ") {
+                    if let Some(new_database_name) = extract_db_name(&line) {
+                        database_name = new_database_name;
+                        match create_or_connect_database(&database_name).await {
+                            Ok(pool) => {
+                                println!("Database connection established to '{}'.", database_name);
+                                sql_pool = Some(pool);
+                            },
+                            Err(e) => {
+                                eprintln!("Error connecting to database '{}': {}", database_name, e);
+                                sql_pool = None; // Reset the pool if connection fails
+                            }
+                        }
+                    } else {
+                        eprintln!("Invalid database name.");
+                    }
                 }
-                if line.to_lowercase() == "exit" {
+                else if line.to_lowercase().starts_with("drop schema ") {
+                    if let Some(pool) = &sql_pool {
+                        println!("\nClosing database connection...");
+                        pool.close().await;
+                        println!("Connection closed.");
+                        database_name = "None".to_string();
+                    }
+                }
+                else if line.to_lowercase() == "show tables;" {
+                    // Handling "show tables" command
+                    if let Some(pool) = &sql_pool {
+                        let show_tables_query = "SELECT name FROM sqlite_master WHERE type='table';";
+                        match execute_sql(pool, show_tables_query).await {
+                            Ok(_) => println!("\nQuery executed successfully.\n"),
+                            Err(e) => println!("\nError executing query: {}\n", e),
+                        }
+                    } else {
+                        println!("No database selected.");
+                    }
+                }
+                else if line.to_lowercase().starts_with("drop database ") {
+                    if let Some(new_database_name) = extract_db_name(&line) {
+                        if let Some(pool) = &sql_pool {
+                            println!("Closing database connection...");
+                            pool.close().await;
+                            println!("Connection closed.");
+                        }
+                
+                        let db_file_path = format!("{}", new_database_name);
+                        match std::fs::remove_file(&db_file_path) {
+                            Ok(_) => println!("Database '{}' dropped successfully.", new_database_name),
+                            Err(e) => eprintln!("Error dropping database '{}': {}", new_database_name, e),
+                        }
+                
+                        database_name = "None".to_string();
+                        sql_pool = None;
+                    } else {
+                        eprintln!("Invalid database name.");
+                    }
+                }
+                else if line.to_lowercase() == "exit" {
+                    if let Some(pool) = sql_pool {
+                        println!("Closing database connection...");
+                        pool.close().await;
+                        println!("Connection closed.");
+                    }
                     break;
-                }
-                match execute_sql(&sql_pool, &line).await {
-                    Ok(_) => println!("Query executed successfully."),
-                    Err(e) => println!("Error executing query: {}", e),
+                } else {
+                    if let Some(pool) = &sql_pool {
+                        match execute_sql(pool, &line).await {
+                            Ok(_) => println!("\nQuery executed successfully.\n"),
+                            Err(e) => println!("\nError executing query: {}\n", e),
+                        }
+                    } else {
+                        println!("No database selected.");
+                    }
                 }
             },
             Err(ReadlineError::Interrupted) | Err(ReadlineError::Eof) => {
+                if let Some(pool) = sql_pool {
+                    println!("Closing database connection due to interruption...");
+                    pool.close().await;
+                    println!("Connection closed.");
+                }
                 break;
             },
             Err(err) => {
