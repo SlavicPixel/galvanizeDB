@@ -1,3 +1,4 @@
+use std::path::Path;
 use sqlx::{Column, Result, Row, TypeInfo};
 use sqlx::sqlite::SqlitePool;
 use rustyline::Editor;
@@ -9,14 +10,12 @@ fn extract_db_name(input: &str) -> Option<String> {
     let parts: Vec<&str> = input.split_whitespace().collect();
 
     if parts.len() >= 2 {
-        let command = parts[0].to_uppercase(); // Convert the command to uppercase for case-insensitive comparison
+        let command = parts[0].to_uppercase();
 
         if command == "USE" && parts.len() == 2 {
-            // Handle "USE database_name;" case
             let database_name = parts[1].strip_suffix(';').unwrap_or(parts[1]);
             Some(format_db_name(database_name))
         } else if (command == "CREATE" || command == "DROP") && parts.len() >= 3 && parts[1].eq_ignore_ascii_case("database") {
-            // Handle "CREATE DATABASE database_name;" case
             let database_name = parts[2].strip_suffix(';').unwrap_or(parts[2]);
             Some(format_db_name(database_name))
         } else {
@@ -27,7 +26,6 @@ fn extract_db_name(input: &str) -> Option<String> {
     }
 }
 
-// Helper function to format the database name
 fn format_db_name(name: &str) -> String {
     let mut formatted_name = name.to_string();
 
@@ -37,6 +35,30 @@ fn format_db_name(name: &str) -> String {
 
     formatted_name
 }
+
+fn db_file_check(db_file_name: &str) -> bool {
+    let path = Path::new(&db_file_name);
+
+    if path.exists(){
+        return true;
+    }
+    return false;
+}
+
+fn help() {
+    println!(
+        "\nGalvanizeDB Basic Manual\n\
+        ---------------------------\n\
+        Create a database:\n    CREATE DATABASE database_name;\n\n\
+        Connect to a database:\n    USE database_name;\n\n\
+        List tables in a database:\n    SHOW TABLES;\n\n\
+        Close connection to a database:\n    DROP SCHEMA database_name;\n\n\
+        When connected to a database, use standard SQLite queries to interact with the database.\n\n\
+        Type 'exit' to close GalvanizeDB CLI.\n\n\
+        Report issues at: https://github.com/SlavicPixel/galvanizedb\n"
+    );
+}
+
 
 async fn create_or_connect_database(db_name: &str) -> Result<SqlitePool, sqlx::Error> {
     let database_url: String = format!("sqlite:{}?mode=rwc", db_name);
@@ -61,14 +83,13 @@ async fn execute_sql(pool: &SqlitePool, sql: &str) -> anyhow::Result<()> {
                 let length = match col.type_info().name() {
                     "TEXT" => row.try_get::<String, _>(col.name()).map(|v| v.len()).unwrap_or(0),
                     "INTEGER" => row.try_get::<i64, _>(col.name()).map(|v| v.to_string().len()).unwrap_or(0),
-                    // TODO: add support for other types, ex. date
                     _ => "Unsupported type".len(),
                 };
                 column_widths[i] = std::cmp::max(column_widths[i], length);
             }
         }
 
-        // Function to create a horizontal line
+        // Print horizontal line
         let create_line = |widths: &[usize]| {
             widths
                 .iter()
@@ -96,7 +117,6 @@ async fn execute_sql(pool: &SqlitePool, sql: &str) -> anyhow::Result<()> {
                     "TEXT" => row.try_get::<String, _>(col.name()).unwrap_or_default(),
                     "INTEGER" => row.try_get::<i64, _>(col.name()).map(|v| v.to_string()).unwrap_or_default(),
                     _ => {
-                        // Attempt to get the value as f64 for any other types, including REAL and potential aggregate results
                         row.try_get::<f64, _>(col.name()).map(|v| v.to_string())
                             .unwrap_or_else(|_| "Unsupported type".to_string())
                     },
@@ -126,6 +146,8 @@ async fn main() -> Result<()> {
     let mut database_name = "None".to_string();
     let mut sql_pool: Option<SqlitePool> = None;
 
+    println!("Welcome to the GalvanizeDB CLI. Type help or ? to list commands.\n");
+
     loop {
         let prompt = format!("GalvanizeDB [{}]> ", database_name);
 
@@ -133,16 +155,22 @@ async fn main() -> Result<()> {
             Ok(line) => {
                 let _ = rl.add_history_entry(line.as_str());
 
-                if line.to_lowercase().starts_with("use ") || line.to_lowercase().starts_with("create database ") {
-                    if let Some(new_database_name) = extract_db_name(&line) {
-                        database_name = new_database_name;
+                if line.to_lowercase().starts_with("use ") || line.to_lowercase().starts_with("create database "){
+                    if let Some(active_database_name) = extract_db_name(&line) {
+                        database_name = active_database_name;
+                        if !db_file_check(&database_name) && line.to_lowercase().starts_with("use "){
+                            println!("{} does not exist. \nAttempting to create {}", database_name, database_name);
+                        }
                         match create_or_connect_database(&database_name).await {
                             Ok(pool) => {
-                                println!("Database connection established to '{}'.", database_name);
+                                if line.to_lowercase().starts_with("create database ") {
+                                    println!("{} successfully created.", database_name);
+                                }
+                                println!("Database connection established to '{}'.\n", database_name);
                                 sql_pool = Some(pool);
                             },
                             Err(e) => {
-                                eprintln!("Error connecting to database '{}': {}", database_name, e);
+                                eprintln!("Error connecting to database '{}': {}\n", database_name, e);
                                 sql_pool = None; // Reset the pool if connection fails
                             }
                         }
@@ -152,14 +180,13 @@ async fn main() -> Result<()> {
                 }
                 else if line.to_lowercase().starts_with("drop schema ") {
                     if let Some(pool) = &sql_pool {
-                        println!("\nClosing database connection...");
+                        println!("Closing database connection...");
                         pool.close().await;
-                        println!("Connection closed.");
+                        println!("Connection closed.\n");
                         database_name = "None".to_string();
                     }
                 }
                 else if line.to_lowercase() == "show tables;" {
-                    // Handling "show tables" command
                     if let Some(pool) = &sql_pool {
                         let show_tables_query = "SELECT name FROM sqlite_master WHERE type='table';";
                         match execute_sql(pool, show_tables_query).await {
@@ -189,6 +216,9 @@ async fn main() -> Result<()> {
                     } else {
                         eprintln!("Invalid database name.");
                     }
+                }
+                else if line.to_lowercase() == "help" || line == "?" {
+                    help();
                 }
                 else if line.to_lowercase() == "exit" {
                     if let Some(pool) = sql_pool {
